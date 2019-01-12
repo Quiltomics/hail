@@ -81,15 +81,15 @@ func New() *KubeClient {
 }
 
 func CreatePod(k *KubeClient, jobRequest []byte) error {
-	metadata=kube.client.V1ObjectMeta(generate_name='job-{}-'.format(self.id),
-                                              labels={
-                                                  'app': 'batch-job',
-                                                  'hail.is/batch-instance': instance_id,
-                                                  'uuid': uuid.uuid4().hex
-            }),
-	job, err := jobs.CreateJob(jobRequest)
+	// metadata=kube.client.V1ObjectMeta(generate_name='job-{}-'.format(self.id),
+	//                                             labels={
+	//                                                 'app': 'batch-job',
+	//                                                 'hail.is/batch-instance': instance_id,
+	//                                                 'uuid': uuid.uuid4().hex
+	//           }),
+	_, err := jobs.CreateJob(jobRequest)
 
-	pod, err = clientset.CoreV1().Pods(pod.Namespace).Create(pod)
+	// pod, err = clientset.CoreV1().Pods(pod.Namespace).Create(pod)
 
 	return err
 }

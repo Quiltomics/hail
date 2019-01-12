@@ -1,4 +1,3 @@
 {
-  "python.linting.pylintEnabled": true,
-  "go.gopath": "~/.goenv/go-server"
+  "python.linting.pylintEnabled": true
 }
