@@ -2,11 +2,14 @@ CREATE DATABASE IF NOT EXISTS jobs;
 
 CREATE TABLE IF NOT EXISTS jobs.job (
     id INT AUTO_INCREMENT PRIMARY KEY,
-    parent_id INT,
+     INT,
     attributes JSON,
-    callback MEDIUMTEXT,
+    callback JSON,
     pod_template JSON,
-    exit_code INT
+    pod_status JSON,
+    exit_code SMALLINT
+    start_time TIMESTAMP
+    end_time TIMESTAMP
 ) ENGINE=INNODB;
 
 CREATE TABLE IF NOT EXISTS jobs.batch (

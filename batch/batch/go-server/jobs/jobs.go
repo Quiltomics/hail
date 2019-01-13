@@ -7,10 +7,10 @@ package jobs
 // TODO: Add caching layer
 
 import (
+	"errors"
+	"fmt"
 	"io/ioutil"
 	"log"
-
-	"github.com/akotlar/hail-go-batch/utils"
 
 	jsoniter "github.com/json-iterator/go"
 	kubeApi "golang.org/x/build/kubernetes/api"
@@ -26,6 +26,12 @@ import (
 var jsonFast = jsoniter.ConfigFastest
 var instanceID = uuid.New().String()
 
+const (
+	Cancelled   int16 = -3
+	Initialized int16 = -2
+	Created     int16 = -1
+)
+
 type dbConfig struct {
 	DB struct {
 		// https://github.com/go-sql-driver/mysql#dsn-data-source-name
@@ -33,7 +39,9 @@ type dbConfig struct {
 	}
 }
 
-// Jobs contains a database handle and a map of prepared, commonly-used SQL statements
+// Jobs defines shared resources needed to manage pods
+// contains a database handle and a map of prepared, commonly-used SQL statements
+// These statements need to be closed after Jobs is no longer used, to prevent memory leaks
 type Jobs struct {
 	db         *sql.DB
 	statements map[string]*sql.Stmt
@@ -41,30 +49,42 @@ type Jobs struct {
 
 // New instantiates the Jobs struct, storing a handle to the relevant database
 // and prepares/stores commonly used sql statements to avoid perf overhead
-// These statements must be .Close() to avoid memory leak, using Jobs.Cleanup()
-func New() *Jobs {
+func New() (*Jobs, error) {
 	var dbConf dbConfig
 
+	// TODO: Lock and read/unmarshal this only once
 	d, err := ioutil.ReadFile("./jobs.yml")
 
-	utils.PanicErr(err)
+	if err != nil {
+		return nil, err
+	}
 
-	yaml.Unmarshal(d, &dbConf)
+	err = yaml.Unmarshal(d, &dbConf)
+
+	if err != nil {
+		return nil, err
+	}
 
 	// No need to close/defer close
 	// https://golang.org/pkg/database/sql/#Open
 	db, err := sql.Open("mysql", dbConf.DB.DSN)
 
-	utils.PanicErr(err)
+	if err != nil {
+		return nil, err
+	}
 
-	statements := prepareStatements(db)
+	statements, err := prepareStatements(db)
+
+	if err != nil {
+		return nil, err
+	}
 
 	j := &Jobs{
 		db:         db,
 		statements: statements,
 	}
 
-	return j
+	return j, nil
 }
 
 // Cleanup closes all prepared statements to avoid leaking memory
@@ -77,22 +97,16 @@ func Cleanup(j *Jobs) {
 	j.db.Close()
 }
 
-func prepareStatements(db *sql.DB) map[string]*sql.Stmt {
+func prepareStatements(db *sql.DB) (map[string]*sql.Stmt, error) {
 	s := make(map[string]*sql.Stmt, 3)
+	var err error
 
-	s["jobs.create"] = prepareStmt(db, "INSERT INTO jobs.job (attributes,callback,pod_template,exit_code) VALUES(?,?,?,?,?)")
-	s["batch.create"] = prepareStmt(db, "INSERT INTO jobs.batch (attributes,callback,pod_template,exit_code) VALUES(?,?,?,?,?)")
-	s["job_batch.create"] = prepareStmt(db, "INSERT INTO jobs.job_batch (job_id,batch_id) VALUES(?,?)")
+	s["jobs.create"], err = db.Prepare("INSERT INTO jobs.job (kube_id,attributes,callback,pod_template) VALUES(?,?,?,?,?)")
+	s["jobs.update.container_state.kube_id"], err = db.Prepare("UPDATE jobs.job SET container_state=?,status=? WHERE kube_id=?")
+	s["batch.create"], err = db.Prepare("INSERT INTO jobs.batch (kube_id,attributes,callback,pod_template) VALUES(?,?,?,?,?)")
+	s["job_batch.create"], err = db.Prepare("INSERT INTO jobs.job_batch (job_id,batch_id) VALUES(?,?)")
 
-	return s
-}
-
-func prepareStmt(db *sql.DB, query string) *sql.Stmt {
-	stmt, err := db.Prepare(query)
-
-	utils.PanicErr(err)
-
-	return stmt
+	return s, err
 }
 
 // JobRequest defines the structure of the JSON string that is sent to batch server
@@ -109,51 +123,55 @@ type JobRequest struct {
 
 // The resulting job
 type Job struct {
-	ID          int                      `json:"id"`
+	ID int `json:"id"`
+	// TODO: Decide if we need this, or whether to make database id the
+	// kubernetes-side id. Reasons not to use ID: either need uuid (4 bytes) or 2 sql trips
+	KubeID      string                   `json:"kube_id"`
 	BatchID     int                      `json:"batch_id"`
 	Attributes  map[string]string        `json:"attributes"`
 	Callback    string                   `json:"callback"`
 	PodTemplate *kubeApi.PodTemplateSpec `json:"pod_template"`
-	// Currently not implemented
-	// ContainerState kubeApi.ContainerState `json:"container_state"`
-	// One of Created/Complete/Cancelled
-	State    string `json:"state"`
-	ExitCode int    `json:"exit_code"`
+	PodStatus   *kubeApi.PodStatus       `json:"pod_status"`
+	// ExitCode: Values less than 0 indicate initialization or cancelleation
+	// while values 0 or greater indicate some completion s Change from Batch 0.2 behavior
+	// No longer dedicated "State" variable
+	// ExitCo
+	ExitCode int16 `json:"exit_code"`
 }
 
 // Create a common ID, Attributes map[string] for a number of jobs
 // We handle this by creating a new entyr in the Batches MySQL table
 // And
 type Batch struct {
+	ID         int               `json:"id"`
+	KubeID     string            `json:"kube_id"`
 	Attributes map[string]string `json:"attributes"`
 }
 
-const (
-	STATUS_INIT      = "Initialized"
-	STATUS_CREATED   = "Created"
-	STATUS_COMPLETED = "Completed"
-	STATUC_CANCELLED = "Cancelled"
-)
-
 // Takes a json string, validates it to match Kubernetes V1 Api
 // TODO: Consider BatchID check: may be useful to use a validation library
-func CreateJob(jobs *Jobs, jsonStr []byte) *Job {
-	req := unmarshal(jsonStr)
+func CreateJob(jobs *Jobs, jsonStr []byte) (*Job, error) {
+	req, err := unmarshal(jsonStr)
+
+	if err != nil {
+		return nil, err
+	}
 
 	if req.BatchID == nil {
-		panic("Must provide a batch_id")
+		return nil, errors.New("Must provide batch_id")
 	}
+
+	// Avoid 2nd mysql insert
+	kubeID := uuid.New().String()
 
 	podTemplate := &kubeApi.PodTemplateSpec{
 		ObjectMeta: kubeApi.ObjectMeta{
-			// Not storing generate-name, because we will be able to query
-			// the stored JSON, don't maintain state to get a count-based "id"
-			// don't want to incur an extra query, and using uuid to create a
-			// unique name is either unnecessary, or non-informative (uuid label)
+			// Is the extra dash to allow an id for non-job jobs?
+			GenerateName: fmt.Sprintf("job-%s-", kubeID),
 			Labels: map[string]string{
 				"app":                    "batch-job",
 				"hail.is/batch-instance": instanceID,
-				"uuid":                   uuid.New().String(),
+				"uuid":                   kubeID,
 			},
 		},
 		Spec: req.Spec,
@@ -161,21 +179,29 @@ func CreateJob(jobs *Jobs, jsonStr []byte) *Job {
 
 	pJSON, err := jsonFast.Marshal(podTemplate)
 
-	utils.PanicErr(err)
+	if err != nil {
+		return nil, err
+	}
 
+	// 0 exit_status is the default; only makes sense in context of status == Complete / Cancelled
 	result, err := jobs.statements["jobs.create"].Exec(
-		req.Attributes, req.Callback, pJSON, -1,
+		kubeID, req.Attributes, req.Callback, pJSON, 0,
 	)
 
 	id, err := result.LastInsertId()
 
-	utils.PanicErr(err)
+	if err != nil {
+		return nil, err
+	}
 
+	// TODO: potentially combine into one compound query
 	result, err = jobs.statements["job_batch.create"].Exec(
 		id, *req.BatchID,
 	)
 
-	utils.PanicErr(err)
+	if err != nil {
+		return nil, err
+	}
 
 	j := &Job{
 		ID:          int(id),
@@ -183,20 +209,29 @@ func CreateJob(jobs *Jobs, jsonStr []byte) *Job {
 		Attributes:  req.Attributes,
 		PodTemplate: podTemplate,
 		Callback:    req.Callback,
-		State:       STATUS_INIT,
+		// Job is created when Kubernetes successfully creates this job
+		// TODO: Should we wait until
+		ExitCode: Initialized,
 	}
 
-	return j
+	return j, nil
 }
 
-func unmarshal(jsonStr []byte) *JobRequest {
+func MarkJob(job *Job, id int, status int16) error {
+	if status < Cancelled {
+		return errors.New("Invalid status, expect -3 to 255")
+	}
+
+	return nil
+}
+
+// This is a separate function to allow swapping of unmarshal functions
+func unmarshal(jsonStr []byte) (*JobRequest, error) {
 	var j *JobRequest
 
 	err := jsonFast.Unmarshal(jsonStr, &j)
 
-	utils.PanicErr(err)
-
-	return j
+	return j, err
 }
 
 // CreateBatch inserts a new entry in the jobs.batch table, and returns a JSON

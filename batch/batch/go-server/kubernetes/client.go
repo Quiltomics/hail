@@ -10,7 +10,7 @@ import (
 
 	jobs "github.com/akotlar/hail-go-batch/jobs"
 	kubeErrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	// https://github.com/kubernetes/client-go/blob/53c7adfd0294caa142d961e1f780f74081d5b15f/examples/out-of-cluster-client-configuration/main.go#L31
 	// import auth providers, needed for OIDC
@@ -129,7 +129,7 @@ func getClient() (config *kubeRest.Config, clientset *kubernetes.Clientset, err 
 func getPods(clientset *kubernetes.Clientset) {
 
 	for {
-		pods, err := clientset.CoreV1().Pods("").List(metav1.ListOptions{})
+		pods, err := clientset.CoreV1().Pods("").List(v1.ListOptions{})
 		if err != nil {
 			panic(err.Error())
 		}
@@ -138,7 +138,7 @@ func getPods(clientset *kubernetes.Clientset) {
 		// Examples for error handling:
 		// - Use helper functions like e.g. errors.IsNotFound()
 		// - And/or cast to StatusError and use its properties like e.g. ErrStatus.Message
-		_, err = clientset.CoreV1().Pods("default").Get("example-xxxxx", metav1.GetOptions{})
+		_, err = clientset.CoreV1().Pods("default").Get("example-xxxxx", v1.GetOptions{})
 		if kubeErrors.IsNotFound(err) {
 			fmt.Printf("Pod not found\n")
 		} else if statusError, isStatus := err.(*kubeErrors.StatusError); isStatus {
