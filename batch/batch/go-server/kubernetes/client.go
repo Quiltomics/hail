@@ -1,6 +1,7 @@
 package kubernetes
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -8,50 +9,63 @@ import (
 	"strconv"
 	"time"
 
-	jobs "github.com/akotlar/hail-go-batch/jobs"
 	kubeErrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
+	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	coreV1 "k8s.io/api/core/v1"
+	informers "k8s.io/client-go/informers"
+	kubernetes "k8s.io/client-go/kubernetes"
 	// https://github.com/kubernetes/client-go/blob/53c7adfd0294caa142d961e1f780f74081d5b15f/examples/out-of-cluster-client-configuration/main.go#L31
 	// import auth providers, needed for OIDC
 	// avoids No Auth Provider found for name "gcp"
 	// _ avoids "imported and not used"
+	kubeApi "golang.org/x/build/kubernetes/api"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	kubeRest "k8s.io/client-go/rest"
-	kubeClientCmd "k8s.io/client-go/tools/clientcmd"
-
-	"github.com/google/uuid"
+	clientcmd "k8s.io/client-go/tools/clientcmd"
 )
 
+// interface Jobs {
+// 	OnAdded
+// 	OnDeleted
+// }
+
 type KubeClient struct {
-	timeout    int //milliseconds
-	namespace  string
-	config     *kubeRest.Config
-	clientset  *kubernetes.Clientset
-	instanceID string
-	label      string
+	Timeout               int //milliseconds
+	Namespace             string
+	Config                *kubeRest.Config
+	Clientset             *kubernetes.Clientset
+	SharedInformerFactory informers.SharedInformerFactory
 }
 
-// https://nathanleclaire.com/blog/2014/08/09/dont-get-bitten-by-pointer-vs-non-pointer-method-receivers-in-golang/
-// https://golang.org/doc/faq#methods_on_values_or_pointers
-func (k *KubeClient) DoStuff() {
-	fmt.Print("Hello world")
-
-}
-
+// TODO: allow configuration per consumer of namespace, resync, etc
+// Pass in YAML or use 12-factor-like env variables
 // https://github.com/kubernetes/client-go/blob/master/examples/out-of-cluster-client-configuration/main.go
-//
-func New() *KubeClient {
+func New() (*KubeClient, error) {
 	config, clientset, err := getClient()
 
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 
-	namespace := os.Getenv("POD_NAMESPACE")
+	namespace := os.Getenv("POD_NAMESPACE") // maintain compatibility with existing server
 
 	if namespace == "" {
-		panic("Please set the environemt variable POD_NAMESPACE (e.g: export POD_NAMESPACE=test")
+		return nil, errors.New("Please set the environment variable POD_NAMESPACE (e.g: export POD_NAMESPACE=test")
+	}
+
+	var resyncTime time.Duration
+
+	resyncTimeStr := os.Getenv("KUBERNETES_RESYNC_PERIOD")
+	if resyncTimeStr == "" {
+		resyncTime = time.Second * 60
+	} else {
+		seconds, err := strconv.Atoi(resyncTimeStr)
+
+		if err != nil {
+			return nil, err
+		}
+
+		resyncTime = time.Second * time.Duration(seconds)
 	}
 
 	timeoutStr := os.Getenv("KUBERNETES_TIMEOUT_IN_SECONDS")
@@ -68,37 +82,35 @@ func New() *KubeClient {
 		}
 	}
 
-	instanceID := uuid.New().String()
+	f := informers.NewSharedInformerFactoryWithOptions(clientset, resyncTime, informers.WithNamespace(namespace))
 
 	return &KubeClient{
-		config:     config,
-		clientset:  clientset,
-		namespace:  namespace,
-		timeout:    timeout,
-		instanceID: instanceID,
-		label:      fmt.Sprintf("app=batch-job,hail.is/batch-instance=%s", instanceID),
-	}
+		Timeout:               timeout,
+		Namespace:             namespace,
+		Config:                config,
+		Clientset:             clientset,
+		SharedInformerFactory: f,
+	}, nil
 }
 
-func CreatePod(k *KubeClient, jobRequest []byte) error {
-	// metadata=kube.client.V1ObjectMeta(generate_name='job-{}-'.format(self.id),
-	//                                             labels={
-	//                                                 'app': 'batch-job',
-	//                                                 'hail.is/batch-instance': instance_id,
-	//                                                 'uuid': uuid.uuid4().hex
-	//           }),
-	_, err := jobs.CreateJob(jobRequest)
-
-	// pod, err = clientset.CoreV1().Pods(pod.Namespace).Create(pod)
-
-	return err
+func CreatePod(k *KubeClient, podTemplate *kubeApi.PodTemplateSpec) {
+	// res, err := k.Clientset.CoreV1().Pods(k.Namespace).Create(&coreV1.Pod{
+	// 	ObjectMeta: podTemplate.ObjectMeta,
+	// 	Spec:       podTemplate.Spec,
+	// })
+	// TODO: This seems like a waste of effort, but coreV1.Pod contains state as
+	// well
+	pod := coreV1.Pod{
+		ObjectMeta: podTemplate.ObjectMeta,
+		Spec:       podTemplate.Spec,
+	}
 }
 
 func getClient() (config *kubeRest.Config, clientset *kubernetes.Clientset, err error) {
 	useKube, err := parseBool(os.Getenv("BATCH_USE_KUBE_CONFIG"))
 
 	if err != nil {
-		panic(fmt.Sprintf("Invalid BATCH_USE_KUBE_CONFIG value %v", err))
+		return nil, nil, err
 	}
 
 	if useKube != false {
@@ -113,7 +125,7 @@ func getClient() (config *kubeRest.Config, clientset *kubernetes.Clientset, err 
 		flag.Parse()
 
 		// use the current context in kubeconfig
-		config, err = kubeClientCmd.BuildConfigFromFlags("", *kubeconfig)
+		config, err = clientcmd.BuildConfigFromFlags("", *kubeconfig)
 	}
 
 	if err != nil {
@@ -126,10 +138,10 @@ func getClient() (config *kubeRest.Config, clientset *kubernetes.Clientset, err 
 	return config, clientset, err
 }
 
-func getPods(clientset *kubernetes.Clientset) {
+func getPods(k *KubeClient) {
 
 	for {
-		pods, err := clientset.CoreV1().Pods("").List(v1.ListOptions{})
+		pods, err := k.Clientset.CoreV1().Pods("").List(metaV1.ListOptions{})
 		if err != nil {
 			panic(err.Error())
 		}
@@ -138,7 +150,7 @@ func getPods(clientset *kubernetes.Clientset) {
 		// Examples for error handling:
 		// - Use helper functions like e.g. errors.IsNotFound()
 		// - And/or cast to StatusError and use its properties like e.g. ErrStatus.Message
-		_, err = clientset.CoreV1().Pods("default").Get("example-xxxxx", v1.GetOptions{})
+		_, err = k.Clientset.CoreV1().Pods("default").Get("example-xxxxx", metaV1.GetOptions{})
 		if kubeErrors.IsNotFound(err) {
 			fmt.Printf("Pod not found\n")
 		} else if statusError, isStatus := err.(*kubeErrors.StatusError); isStatus {
@@ -170,4 +182,169 @@ func homeDir() string {
 	}
 	return os.Getenv("USERPROFILE") // windows
 }
+
+// //adapted from https://github.com/dtan4/k8s-pod-notifier/blob/master/kubernetes/client.go
+// // https://github.com/kubernetes/client-go/blob/master/tools/cache/listwatch.go
+// // https://medium.com/programming-kubernetes/building-stuff-with-the-kubernetes-api-part-4-using-go-b1d0e3c1c899
+
+// // TODO: Add cache
+// // https://github.com/kubernetes/client-go/tree/master/examples/workqueue
+// package kubernetes
+
+// import (
+// 	"context"
+
+// 	"github.com/pkg/errors"
+// 	log "github.com/sirupsen/logrus"
+// 	"k8s.io/apimachinery/pkg/watch"
+// 	"k8s.io/apimachinery/pkg/apis/meta/v1"
+
+// 	"github.com/akotlar/hail-go-batch/kubernetes/jobs"
+// )
+
+// // WatchPodEvents watches Pod events
+// func (c *KubeClient, j *jobs.Jobs) WatchPodEvents(namespace, labels string, notifySuccess, notifyFail bool, succeededFunc, failedFunc NotifyFunc) error {
+// 	watcher, err := c.clientset.CoreV1().Pods(c.namespace).Watch(v1.ListOptions{
+// 		LabelSelector: labels,
+// 	})
+// 	if err != nil {
+// 		return errors.Wrap(err, "cannot create Pod event watcher")
+// 	}
+
+// 	go func() {
+// 		for {
+// 			select {
+// 			case e := <-watcher.ResultChan():
+// 				if e.Object == nil {
+// 					return
+// 				}
+
+// 				pod, ok := e.Object.(*v1.Pod)
+// 				if !ok {
+// 					continue
+// 				}
+
+// 				log.WithFields(log.Fields{
+// 					"action":     e.Type,
+// 					"namespace":  pod.Namespace,
+// 					"name":       pod.Name,
+// 					"phase":      pod.Status.Phase,
+// 					"reason":     pod.Status.Reason,
+// 					"container#": len(pod.Status.ContainerStatuses),
+// 				}).Debug("event notified")
+
+// 				switch e.Type {
+// 				case watch.Modified:
+// 					if pod.DeletionTimestamp != nil {
+// 						continue
+// 					}
+
+// 					startedAt := pod.CreationTimestamp.Time
+
+// 					switch pod.Status.Phase {
+// 					case v1.PodSucceeded:
+// 						for _, cst := range pod.Status.ContainerStatuses {
+// 							if cst.State.Terminated == nil {
+// 								continue
+// 							}
+
+// 							finishedAt := cst.State.Terminated.FinishedAt.Time
+
+// 							if cst.State.Terminated.Reason == "Completed" {
+// 								if notifySuccess {
+// 									succeededFunc(&PodEvent{
+// 										Namespace:  pod.Namespace,
+// 										PodName:    pod.Name,
+// 										StartedAt:  startedAt,
+// 										FinishedAt: finishedAt,
+// 										ExitCode:   0,
+// 										Reason:     "",
+// 										Message:    "",
+// 									})
+// 								}
+// 							} else {
+// 								if notifyFail {
+// 									failedFunc(&PodEvent{
+// 										Namespace:  pod.Namespace,
+// 										PodName:    pod.Name,
+// 										StartedAt:  startedAt,
+// 										FinishedAt: finishedAt,
+// 										ExitCode:   int(cst.State.Terminated.ExitCode),
+// 										Reason:     cst.State.Terminated.Reason,
+// 										Message:    "",
+// 									})
+// 								}
+// 							}
+
+// 							break
+// 						}
+// 					case v1.PodFailed:
+// 						if len(pod.Status.ContainerStatuses) == 0 { // e.g. Pod was evicted
+// 							if notifyFail {
+// 								failedFunc(&PodEvent{
+// 									Namespace:  pod.Namespace,
+// 									PodName:    pod.Name,
+// 									StartedAt:  startedAt,
+// 									FinishedAt: startedAt,
+// 									ExitCode:   -1,
+// 									Reason:     pod.Status.Reason,
+// 									Message:    pod.Status.Message,
+// 								})
+// 							}
+// 						} else {
+// 							for _, cst := range pod.Status.ContainerStatuses {
+// 								if cst.State.Terminated == nil {
+// 									continue
+// 								}
+
+// 								if notifyFail {
+// 									finishedAt := cst.State.Terminated.FinishedAt.Time
+
+// 									failedFunc(&PodEvent{
+// 										Namespace:  pod.Namespace,
+// 										PodName:    pod.Name,
+// 										StartedAt:  startedAt,
+// 										FinishedAt: finishedAt,
+// 										ExitCode:   int(cst.State.Terminated.ExitCode),
+// 										Reason:     cst.State.Terminated.Reason,
+// 										Message:    pod.Status.Message,
+// 									})
+// 								}
+
+// 								break
+// 							}
+// 						}
+// 					default:
+// 						for _, cst := range pod.Status.ContainerStatuses {
+// 							if cst.State.Terminated == nil {
+// 								continue
+// 							}
+
+// 							if notifyFail {
+// 								finishedAt := cst.State.Terminated.FinishedAt.Time
+
+// 								failedFunc(&PodEvent{
+// 									Namespace:  pod.Namespace,
+// 									PodName:    pod.Name,
+// 									StartedAt:  startedAt,
+// 									FinishedAt: finishedAt,
+// 									ExitCode:   int(cst.State.Terminated.ExitCode),
+// 									Reason:     cst.State.Terminated.Reason,
+// 									Message:    pod.Status.Message,
+// 								})
+// 							}
+
+// 							break
+// 						}
+// 					}
+// 				}
+// 			case <-ctx.Done():
+// 				watcher.Stop()
+// 				return
+// 			}
+// 		}
+// 	}()
+
+// 	return nil
+// }
 

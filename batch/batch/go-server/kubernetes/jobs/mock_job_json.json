@@ -1,0 +1,58 @@
+{
+  "batch_id": 1,
+  "attributes": {
+    "a": "one",
+    "b": "two"
+  },
+  "callback": "someCallback",
+  "spec": {
+    "restartPolicy": "never",
+    "apiVersion": "v1",
+    "containers": [
+      {
+        "name": "foo",
+        "image": "bar",
+        "command": ["something"],
+        "args": ["some_arg"],
+        "ports": [
+          {
+            "hostPort": 85,
+            "containerPort": 80,
+            "protocol": "TCP"
+          },
+          {
+            "hostPort": 95,
+            "containerPort": 90,
+            "protocol": "UDP"
+          }
+        ],
+        "env": [
+          {
+            "name": "MYSQL_ROOT_PASSWORD",
+            "value": "password"
+          }
+        ],
+        "resources": {
+          "requests": {
+            "memory": "64Mi",
+            "cpu": "250m"
+          },
+          "limits": {
+            "memory": "128Mi",
+            "cpu": "500m"
+          }
+        }
+      },
+      {
+        "name": "mysql",
+        "image": "mysql","db"
+        "ports": [
+          {
+            "hostPort": 3306,
+            "containerPort": 3306
+          }
+        ]
+      }
+    ]
+  }
+}
